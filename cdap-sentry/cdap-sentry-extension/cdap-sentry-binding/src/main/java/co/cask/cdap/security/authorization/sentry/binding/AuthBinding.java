@@ -34,6 +34,7 @@ import co.cask.cdap.proto.security.Privilege;
 import co.cask.cdap.proto.security.Role;
 import co.cask.cdap.security.authorization.sentry.binding.conf.AuthConf;
 import co.cask.cdap.security.authorization.sentry.binding.conf.AuthConf.AuthzConfVars;
+import co.cask.cdap.security.authorization.sentry.model.ActionFactory;
 import co.cask.cdap.security.authorization.sentry.model.Application;
 import co.cask.cdap.security.authorization.sentry.model.Artifact;
 import co.cask.cdap.security.authorization.sentry.model.Authorizable;
@@ -84,12 +85,9 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.EnumSet;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
@@ -109,7 +107,7 @@ class AuthBinding {
 
   private final LoadingCache<Principal, Set<String>> groupCache;
   private final LoadingCache<String, Set<Role>> roleCache;
-  private final LoadingCache<Role, Map<EntityId, Set<Action>>> entityActionsCache;
+  private final LoadingCache<Role, Set<WildcardPolicy>> policyCache;
 
   AuthBinding(String sentrySite, final String instanceName, final String sentryAdminGroup,
               int cacheTtlSecs, int cacheMaxEntries) {
@@ -126,7 +124,7 @@ class AuthBinding {
         @Override
         public Set<String> load(Principal principal) throws Exception {
           LOG.trace("Group cache miss for principal {}", principal);
-          return getGroups(principal);
+          return fetchGroups(principal);
         }
       });
 
@@ -138,28 +136,28 @@ class AuthBinding {
         @Override
         public Set<Role> load(final String group) throws Exception {
           LOG.trace("Role cache miss for group {}", group);
-          return getRoles(group);
+          return fetchRoles(group);
         }
       });
 
-    entityActionsCache = CacheBuilder.newBuilder()
+    policyCache = CacheBuilder.newBuilder()
       .expireAfterWrite(cacheTtlSecs, TimeUnit.SECONDS)
       .maximumSize(cacheMaxEntries)
-      .build(new CacheLoader<Role, Map<EntityId, Set<Action>>>() {
+      .build(new CacheLoader<Role, Set<WildcardPolicy>>() {
         @SuppressWarnings("NullableProblems")
         @Override
-        public Map<EntityId, Set<Action>> load(final Role role) throws Exception {
-          LOG.trace("Privilege cache miss for role {}", role);
-          return fetchEntityActions(role);
+        public Set<WildcardPolicy> load(final Role role) throws Exception {
+          LOG.trace("Policy cache miss for role {}", role);
+          return fetchPolicies(role);
         }
       });
   }
 
-  private Set<String> getGroups(Principal principal) {
+  private Set<String> fetchGroups(Principal principal) {
     return authProvider.getGroupMapping().getGroups(principal.getName());
   }
 
-  private Set<Role> getRoles(final String group) throws Exception {
+  private Set<Role> fetchRoles(final String group) throws Exception {
     Set<TSentryRole> tSentryRoles = execute(new Command<Set<TSentryRole>>() {
       @Override
       public Set<TSentryRole> run(SentryGenericServiceClient client) throws Exception {
@@ -173,45 +171,38 @@ class AuthBinding {
     return roles;
   }
 
-  private Map<EntityId, Set<Action>> fetchEntityActions(final Role role) throws Exception {
+  private Set<WildcardPolicy> fetchPolicies(final Role role) throws Exception {
     Set<TSentryPrivilege> sentryPrivileges = execute(new Command<Set<TSentryPrivilege>>() {
       @Override
       public Set<TSentryPrivilege> run(SentryGenericServiceClient client) throws Exception {
         return client.listPrivilegesByRoleName(sentryAdminGroup, role.getName(), COMPONENT_NAME, instanceName);
       }
     });
-    Set<Privilege> privileges = toPrivileges(sentryPrivileges);
 
-    if (privileges == null) {
-      LOG.debug("Got no entity-actions for role {}", role);
-      return Collections.emptyMap();
+    if (sentryPrivileges == null) {
+      LOG.debug("Got empty set of policies for role {}", role);
+      return Collections.emptySet();
     }
 
-    Map<EntityId, Set<Action>> result = new HashMap<>(privileges.size());
-    for (Privilege privilege : privileges) {
-      Set<Action> actions = result.get(privilege.getEntity());
-      if (actions == null) {
-        actions = EnumSet.noneOf(Action.class);
-        result.put(privilege.getEntity(), actions);
-      }
-      actions.add(privilege.getAction());
+    Set<WildcardPolicy> policies = new HashSet<>(sentryPrivileges.size());
+    for (TSentryPrivilege sentryPrivilege : sentryPrivileges) {
+      policies.add(new WildcardPolicy(toAuthorizables(sentryPrivilege.getAuthorizables()),
+                                      new ActionFactory.Action(sentryPrivilege.getAction())));
     }
-    LOG.debug("Got entity-actions {} for role {}", result, role);
-    return result;
+
+    LOG.debug("Got policies {} for role {}", policies, role);
+    return Collections.unmodifiableSet(policies);
   }
 
-  Set<Action> getActions(Principal principal, EntityId entityId) throws Exception {
+  Set<WildcardPolicy> getPolicies(Principal principal) throws Exception {
     Set<Role> roles = getRoles(principal, sentryAdminGroup);
 
-    Set<Action> allActions = new HashSet<>();
+    Set<WildcardPolicy> policies = new HashSet<>();
     for (Role role : roles) {
-      Map<EntityId, Set<Action>> ea = entityActionsCache.get(role);
-      Set<Action> actions = ea.get(entityId);
-      if (actions != null) {
-        allActions.addAll(actions);
-      }
+      Set<WildcardPolicy> policy = policyCache.get(role);
+      policies.addAll(policy);
     }
-    return allActions;
+    return Collections.unmodifiableSet(policies);
   }
 
   /**
@@ -753,6 +744,8 @@ class AuthBinding {
       case ARTIFACT:
         Artifact artifact = (Artifact) authorizable;
         assertNonNullParent(parent, Authorizable.AuthorizableType.ARTIFACT);
+        // TODO: this method will be remmoved CDAP-12100
+        //noinspection ConstantConditions
         return ((NamespaceId) parent).artifact(artifact.getArtifactName(), artifact.getArtifactVersion());
       case APPLICATION:
         Application application = (Application) authorizable;
@@ -762,6 +755,8 @@ class AuthBinding {
         Program program = (Program) authorizable;
         assertNonNullParent(parent, Authorizable.AuthorizableType.PROGRAM);
         ApplicationId applicationId = (ApplicationId) parent;
+        // TODO: this method will be remmoved CDAP-12100
+        //noinspection ConstantConditions
         return applicationId.program(program.getProgramType(), program.getProgramName());
       case DATASET:
         Dataset dataset = (Dataset) authorizable;
@@ -794,14 +789,14 @@ class AuthBinding {
   }
 
   /**
-   * Maps {@link EntityId} to a {@link List} of {@link co.cask.cdap.security.authorization.sentry.model.Authorizable}
+   * Maps {@link EntityId} to a {@link List} of {@link Authorizable}
    * by recursively working its way from a given entity.
    *
    * @param entityId {@link EntityId} the entity which needs to be mapped to a list of authorizables
-   * @param authorizables {@link List} of {@link co.cask.cdap.security.authorization.sentry.model.Authorizable} to
+   * @param authorizables {@link List} of {@link Authorizable} to
    * add authorizables to
    */
-  private void toAuthorizables(EntityId entityId, List<org.apache.sentry.core.common.Authorizable> authorizables) {
+  void toAuthorizables(EntityId entityId, List<? super Authorizable> authorizables) {
     EntityType entityType = entityId.getEntityType();
     switch (entityType) {
       case INSTANCE:
@@ -854,5 +849,22 @@ class AuthBinding {
       default:
         throw new IllegalArgumentException(String.format("The entity %s is of unknown type %s", entityId, entityType));
     }
+  }
+
+  Set<ActionFactory.Action> toSentryActions(Set<Action> actions) {
+    Set<ActionFactory.Action> sentryActions = new HashSet<>(actions.size());
+    for (Action action : actions) {
+      sentryActions.add(new ActionFactory.Action(action.name()));
+    }
+    return Collections.unmodifiableSet(sentryActions);
+  }
+
+
+  private static List<Authorizable> toAuthorizables(List<TAuthorizable> tAuthorizables) {
+    List<Authorizable> authorizables = new ArrayList<>(tAuthorizables.size());
+    for (TAuthorizable tAuthorizable : tAuthorizables) {
+      authorizables.add(ModelAuthorizables.from(tAuthorizable.getType(), tAuthorizable.getName()));
+    }
+    return authorizables;
   }
 }
