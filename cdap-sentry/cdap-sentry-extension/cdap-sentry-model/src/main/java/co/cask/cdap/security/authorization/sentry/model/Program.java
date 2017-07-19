@@ -90,7 +90,7 @@ public class Program implements Authorizable {
    */
   @Override
   public String getName() {
-    return programType == null? programName : programType + PROGRAM_DETAILS_SEPARATOR + programName;
+    return programType == null ? programName : programType + PROGRAM_DETAILS_SEPARATOR + programName;
   }
 
   @Nullable
