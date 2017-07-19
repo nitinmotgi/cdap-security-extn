@@ -105,8 +105,11 @@ class AuthBinding {
   private final String instanceName;
   private final String sentryAdminGroup;
 
+  // Cache for principal to groups the principal is part of
   private final LoadingCache<Principal, Set<String>> groupCache;
+  // Cache for group to set of roles the group is part of
   private final LoadingCache<String, Set<Role>> roleCache;
+  // Cache for role to set of policies for the role
   private final LoadingCache<Role, Set<WildcardPolicy>> policyCache;
 
   AuthBinding(String sentrySite, final String instanceName, final String sentryAdminGroup,
@@ -153,47 +156,9 @@ class AuthBinding {
       });
   }
 
-  private Set<String> fetchGroups(Principal principal) {
-    return authProvider.getGroupMapping().getGroups(principal.getName());
-  }
-
-  private Set<Role> fetchRoles(final String group) throws Exception {
-    Set<TSentryRole> tSentryRoles = execute(new Command<Set<TSentryRole>>() {
-      @Override
-      public Set<TSentryRole> run(SentryGenericServiceClient client) throws Exception {
-        return client.listRolesByGroupName(sentryAdminGroup, group, COMPONENT_NAME);
-      }
-    });
-    Set<Role> roles = new HashSet<>();
-    for (TSentryRole tSentryRole : tSentryRoles) {
-      roles.add(new Role(tSentryRole.getRoleName()));
-    }
-    return roles;
-  }
-
-  private Set<WildcardPolicy> fetchPolicies(final Role role) throws Exception {
-    Set<TSentryPrivilege> sentryPrivileges = execute(new Command<Set<TSentryPrivilege>>() {
-      @Override
-      public Set<TSentryPrivilege> run(SentryGenericServiceClient client) throws Exception {
-        return client.listPrivilegesByRoleName(sentryAdminGroup, role.getName(), COMPONENT_NAME, instanceName);
-      }
-    });
-
-    if (sentryPrivileges == null) {
-      LOG.debug("Got empty set of policies for role {}", role);
-      return Collections.emptySet();
-    }
-
-    Set<WildcardPolicy> policies = new HashSet<>(sentryPrivileges.size());
-    for (TSentryPrivilege sentryPrivilege : sentryPrivileges) {
-      policies.add(new WildcardPolicy(toAuthorizables(sentryPrivilege.getAuthorizables()),
-                                      new ActionFactory.Action(sentryPrivilege.getAction())));
-    }
-
-    LOG.debug("Got policies {} for role {}", policies, role);
-    return Collections.unmodifiableSet(policies);
-  }
-
+  /**
+   * @return policies for the given principal
+   */
   Set<WildcardPolicy> getPolicies(Principal principal) throws Exception {
     Set<Role> roles = getRoles(principal, sentryAdminGroup);
 
@@ -859,12 +824,52 @@ class AuthBinding {
     return Collections.unmodifiableSet(sentryActions);
   }
 
-
   private static List<Authorizable> toAuthorizables(List<TAuthorizable> tAuthorizables) {
     List<Authorizable> authorizables = new ArrayList<>(tAuthorizables.size());
     for (TAuthorizable tAuthorizable : tAuthorizables) {
       authorizables.add(ModelAuthorizables.from(tAuthorizable.getType(), tAuthorizable.getName()));
     }
     return authorizables;
+  }
+
+  private Set<String> fetchGroups(Principal principal) {
+    return authProvider.getGroupMapping().getGroups(principal.getName());
+  }
+
+  private Set<Role> fetchRoles(final String group) throws Exception {
+    Set<TSentryRole> tSentryRoles = execute(new Command<Set<TSentryRole>>() {
+      @Override
+      public Set<TSentryRole> run(SentryGenericServiceClient client) throws Exception {
+        return client.listRolesByGroupName(sentryAdminGroup, group, COMPONENT_NAME);
+      }
+    });
+    Set<Role> roles = new HashSet<>();
+    for (TSentryRole tSentryRole : tSentryRoles) {
+      roles.add(new Role(tSentryRole.getRoleName()));
+    }
+    return roles;
+  }
+
+  private Set<WildcardPolicy> fetchPolicies(final Role role) throws Exception {
+    Set<TSentryPrivilege> sentryPrivileges = execute(new Command<Set<TSentryPrivilege>>() {
+      @Override
+      public Set<TSentryPrivilege> run(SentryGenericServiceClient client) throws Exception {
+        return client.listPrivilegesByRoleName(sentryAdminGroup, role.getName(), COMPONENT_NAME, instanceName);
+      }
+    });
+
+    if (sentryPrivileges == null) {
+      LOG.debug("Got empty set of policies for role {}", role);
+      return Collections.emptySet();
+    }
+
+    Set<WildcardPolicy> policies = new HashSet<>(sentryPrivileges.size());
+    for (TSentryPrivilege sentryPrivilege : sentryPrivileges) {
+      policies.add(new WildcardPolicy(toAuthorizables(sentryPrivilege.getAuthorizables()),
+                                      new ActionFactory.Action(sentryPrivilege.getAction())));
+    }
+
+    LOG.debug("Got policies {} for role {}", policies, role);
+    return Collections.unmodifiableSet(policies);
   }
 }
